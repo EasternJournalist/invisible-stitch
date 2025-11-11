@@ -88,7 +88,7 @@ def render(cameras, point_cloud, fill_point_cloud_holes: bool = False, radius: O
         raster_settings = PointsRasterizationSettings(
             image_size=(int(cameras.image_size[0, 1]), int(cameras.image_size[0, 0])), 
             radius = (1 / float(max(cameras.image_size[0, 1], cameras.image_size[0, 0])) * 2.0) if radius is None else radius,
-            points_per_pixel = 16
+            points_per_pixel = 1
         )
 
         # Render the scene

@@ -1,8 +1,10 @@
 import os
+from pathlib import Path
 import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import numpy as np
+import json
 
 import skimage
 from PIL import Image
@@ -12,15 +14,17 @@ import gradio as gr
 from utils.render import PointsRendererWithMasks, render
 from utils.ops import snap_high_gradients_to_nn, project_points, get_pointcloud, merge_pointclouds, outpaint_with_depth_estimation
 
-from tqdm.auto import tqdm
+from tqdm.auto import tqdm, trange
 from pytorch3d.utils import opencv_from_cameras_projection
 from utils.ops import focal2fov, fov2focal
 from utils.models import infer_with_zoe_dc
-from utils.gs import gs_options, read_cameras_from_optimization_bundle, Scene, run_gaussian_splatting, get_blank_gs_bundle
+from utils.gs import gs_options, read_cameras_from_optimization_bundle, Scene, run_gaussian_splatting, get_blank_gs_bundle, render_gaussian_splatting
 from utils.scene import GaussianModel
 from utils.demo import downsample_point_cloud
 from typing import Iterable, Tuple, Dict, Optional, Literal
 import itertools
+
+import imageio
 
 from pytorch3d.structures import Pointclouds
 from pytorch3d.renderer import (
@@ -28,13 +32,49 @@ from pytorch3d.renderer import (
     PerspectiveCameras,
 )
 
-def extrapolate_point_cloud(prompt: str, image_size: Tuple[int, int], look_at_params: Iterable[Tuple[float, float, float, Tuple[float, float, float]]], point_cloud: Pointclouds = None, dry_run: bool = False, discard_mask: bool = False, initial_image: Optional[Image.Image] = None, depth_scaling: float = 1, seed: int = 0, **render_kwargs):
+from utils3d.helpers import timeit
+
+traj_rescale = 1.0
+
+def extrinsics_to_fucking_cameras(extrinsics, image):
+    "Transform opencv extrinsics to fucking pytorch3d cameras, then to the fucking invisible-stitch cameras"
+    "Following the orginal conversion path"
+    optimization_bundle_frames = [] 
+    w = image.width
+    h = image.height
+    for ext in extrinsics:
+        p3d_view = np.diag(np.array([-1, -1, 1, 1], dtype=np.float32)) @ ext
+        R = torch.from_numpy(p3d_view[..., :3, :3]).unsqueeze(0).to(device)
+        T = torch.from_numpy(p3d_view[..., :3, 3]).unsqueeze(0).to(device)
+        cameras = PerspectiveCameras(R=R, T=T, focal_length=torch.tensor([w], dtype=torch.float32), principal_point=(((h-1)/2, (w-1)/2),), image_size=(image.size,), device=device, in_ndc=False)
+        c2w = cameras.get_world_to_view_transform().get_matrix()[0]
+        optimization_bundle_frames.append({
+            "image": image,
+            "transform_matrix": c2w.tolist(),
+        })
+    optimization_bundle = get_blank_gs_bundle(h, w)
+    optimization_bundle['frames'] = optimization_bundle_frames
+    cameras = read_cameras_from_optimization_bundle(optimization_bundle, True)
+    return cameras
+    
+
+
+def extrapolate_point_cloud(prompt: str, image_size: Tuple[int, int], look_at_params: Iterable[Tuple[float, float, float, Tuple[float, float, float]]], extrinsics: np.ndarray, point_cloud: Pointclouds = None, dry_run: bool = False, discard_mask: bool = False, initial_image: Optional[Image.Image] = None, depth_scaling: float = 1, seed: int = 0, ref_depth: np.ndarray = None, **render_kwargs):
+    global traj_rescale, device
     w, h = image_size
     optimization_bundle_frames = []
 
     generator = torch.Generator(device=pipe.device).manual_seed(seed)
-    for azim, elev, dist, at in tqdm(look_at_params):
-        R, T = look_at_view_transform(device=device, azim=azim, elev=elev, dist=dist, at=at)
+
+    num_frames = len(look_at_params) if look_at_params is not None else extrinsics.shape[0]
+    for i in trange(len(look_at_params) if look_at_params is not None else extrinsics.shape[0]):
+        if look_at_params is not None:
+            azim, elev, dist, at = look_at_params[i]
+            R, T = look_at_view_transform(device=device, azim=azim, elev=elev, dist=dist, at=at)
+        else:
+            p3d_view = np.diag(np.array([-1, -1, 1, 1], dtype=np.float32)) @ extrinsics[i]
+            R = torch.from_numpy(p3d_view[:3, :3]).unsqueeze(0).to(device)
+            T = torch.from_numpy(p3d_view[:3, 3]).unsqueeze(0).to(device)
         cameras = PerspectiveCameras(R=R, T=T, focal_length=torch.tensor([w], dtype=torch.float32), principal_point=(((h-1)/2, (w-1)/2),), image_size=(image_size,), device=device, in_ndc=False)
 
         if point_cloud is not None:
@@ -44,7 +84,7 @@ def extrapolate_point_cloud(prompt: str, image_size: Tuple[int, int], look_at_pa
                 eroded_mask = skimage.morphology.binary_erosion((depths[0] > 0).cpu().numpy(), footprint=None)#skimage.morphology.disk(1))
                 eroded_depth = depths[0].clone()
                 eroded_depth[torch.from_numpy(eroded_mask).to(depths.device) <= 0] = 0
-
+        
                 outpainted_img, aligned_depth = outpaint_with_depth_estimation(images[0], masks[0], eroded_depth, h, w, pipe, zoe_dc_model, prompt, cameras, dilation_size=2, depth_scaling=depth_scaling, generator=generator)
 
                 aligned_depth = torch.from_numpy(aligned_depth).to(device)
@@ -56,10 +96,18 @@ def extrapolate_point_cloud(prompt: str, image_size: Tuple[int, int], look_at_pa
         else:
             assert initial_image is not None
             assert not dry_run
-
+            
+            ref_depth = torch.from_numpy(ref_depth).to(device)
+            
             # jumpstart the point cloud with a regular depth estimation
-            t_initial_image = torch.from_numpy(np.asarray(initial_image)/255.).permute(2,0,1).float()
+            t_initial_image = torch.from_numpy(np.asarray(initial_image) / 255.).permute(2,0,1).float()
             depth = aligned_depth = infer_with_zoe_dc(zoe_dc_model, t_initial_image, torch.zeros(h, w))
+            
+            traj_rescale = torch.nanmedian(aligned_depth[0] / ref_depth).item()
+
+            extrinsics = extrinsics.copy()
+            extrinsics[:, :3, 3] *= traj_rescale
+
             outpainted_img = initial_image
             images = [t_initial_image.to(device)]
             masks = [torch.ones(h, w, dtype=torch.bool).to(device)]
@@ -75,9 +123,6 @@ def extrapolate_point_cloud(prompt: str, image_size: Tuple[int, int], look_at_pa
             "image": outpainted_img,
             "mask": masks[0].cpu().numpy(),
             "transform_matrix": c2w.tolist(),
-            "azim": azim,
-            "elev": elev,
-            "dist": dist,
         })
 
         if discard_mask:
@@ -96,7 +141,6 @@ def extrapolate_point_cloud(prompt: str, image_size: Tuple[int, int], look_at_pa
 
         if point_cloud is None:
             point_cloud = get_pointcloud(xy_depth_world[0], device=device, features=rgb)
-
         else:
             # pytorch 3d's mask might be slightly too big (subpixels), so we erode it a little to avoid seams
             # in theory, 1 pixel is sufficient but we use 2 to be safe
@@ -108,7 +152,7 @@ def extrapolate_point_cloud(prompt: str, image_size: Tuple[int, int], look_at_pa
 
     return optimization_bundle_frames, point_cloud
 
-def generate_point_cloud(initial_image: Image.Image, prompt: str, mode: Literal["single", "stage", "360"] = "stage", seed: int = 0):
+def generate_point_cloud(initial_image: Image.Image, prompt: str, mode: Literal["single", "stage", "360"] = "stage", extrinsics: np.ndarray = None, seed: int = 0, ref_depth: np.ndarray = None):
     image_size = initial_image.size
     w, h = image_size
 
@@ -116,16 +160,18 @@ def generate_point_cloud(initial_image: Image.Image, prompt: str, mode: Literal[
 
     step_size = 25
 
-    if mode == "single":
-        azim_steps = [0]
-    elif mode == "stage":
-        azim_steps = [0, step_size, -step_size]
-    elif mode == "360":
-        azim_steps = [x for x in range(0, 360, step_size) if x < 272.5] + [272.5, 316.25]
+    if extrinsics is None:
+        if mode == "single":
+            azim_steps = [0]
+        elif mode == "stage":
+            azim_steps = [0, step_size, -step_size]
+        elif mode == "360":
+            azim_steps = [x for x in range(0, 360, step_size) if x < 272.5] + [272.5, 316.25]
+        look_at_params = [(azim, 0, 0.01, torch.zeros((1, 3))) for azim in azim_steps]
+    else:
+        look_at_params = None
 
-    look_at_params = [(azim, 0, 0.01, torch.zeros((1, 3))) for azim in azim_steps]
-
-    optimization_bundle["frames"], point_cloud = extrapolate_point_cloud(prompt, image_size, look_at_params, discard_mask=True, initial_image=initial_image, depth_scaling=0.5, seed=seed, fill_point_cloud_holes=True)
+    optimization_bundle["frames"], point_cloud = extrapolate_point_cloud(prompt, image_size, look_at_params=look_at_params, extrinsics=extrinsics, discard_mask=True, initial_image=initial_image, depth_scaling=0.5, seed=seed, fill_point_cloud_holes=True, ref_depth=ref_depth)
 
     optimization_bundle["pcd_points"] = point_cloud.points_padded()[0].cpu().numpy()
     optimization_bundle["pcd_colors"] = point_cloud.features_padded()[0].cpu().numpy()
@@ -202,7 +248,6 @@ def generate_scene(image: str, prompt: str, output_path: str = "./output.ply", m
     pbar.set_description("Gaussian Splat Optimization")
 
     scene = Scene(gs_optimization_bundle, GaussianModel(gs_options.sh_degree), gs_options)
-
     scene = run_gaussian_splatting(scene, gs_optimization_bundle)
 
     pbar.update(1)
@@ -216,7 +261,119 @@ def generate_scene(image: str, prompt: str, output_path: str = "./output.ply", m
 
     return output_path
 
+
+def center_crop(image_path, resolution):
+    if isinstance(image_path, (str, os.PathLike)):
+        image = Image.open(image_path)
+    elif isinstance(image_path, Image.Image):
+        image = image_path
+    elif isinstance(image_path, np.ndarray):
+        image = Image.fromarray(image_path)
+    width, height = image.size
+    target_width, target_height = resolution
+   
+    # Calculate target aspect ratio
+    target_ratio = target_width / target_height
+    current_ratio = width / height
+   
+    # Calculate crop dimensions to match target ratio
+    if current_ratio > target_ratio:
+        # Image is too wide, crop width
+        new_width = int(height * target_ratio)
+        new_height = height
+    else:
+        # Image is too tall, crop height
+        new_width = width
+        new_height = int(width / target_ratio)
+       
+     # Calculate crop coordinates
+    left = (width - new_width) // 2
+    top = (height - new_height) // 2
+    right = left + new_width
+    bottom = top + new_height
+   
+    # Perform center crop
+    cropped_image = image.crop((left, top, right, bottom))
+    cropped_image = cropped_image.resize(resolution)
+    return cropped_image
+
+
+def generate_scene_custom(metainfo_path: str, output_path: str = "./output", seed: int = 0):
+    with open(metainfo_path, 'r') as f:
+        metainfo = json.load(f)
+    os.makedirs(output_path, exist_ok=True)
+    image_path = Path(metainfo_path).with_name('input_image.png')
+
+    extrinsics = np.array(metainfo['camera_extrinsics'], dtype=np.float32)
+    ref_depth = np.load(Path(metainfo_path).with_name('moge_depth.npz'))['depth'].astype(np.float32)
+
+    key_indices = np.linspace(0, len(extrinsics) - 1, 10, dtype=int)
+    key_extrinsics = extrinsics[key_indices]  # select 10 key extrinsics evenly spaced
+
+    if 'prompt' in metainfo:
+        prompt = metainfo['prompt']
+    else:
+        prompt = "Generating scenes with the following descriptions: " + " ".join(metainfo['inpainting_prompt_list']).strip()
+
+    global device
+    if torch.cuda.is_available():
+        device = torch.device("cuda:0")
+        torch.cuda.set_device(device)
+    else:
+        device = torch.device("cpu")
+
+    from utils.models import get_zoe_dc_model, get_sd_pipeline
+
+    global zoe_dc_model
+    from huggingface_hub import hf_hub_download
+    zoe_dc_model = get_zoe_dc_model(ckpt_path=hf_hub_download(repo_id="paulengstler/invisible-stitch", filename="invisible-stitch.pt")).to(device)
+
+    global pipe
+    pipe = get_sd_pipeline(device)
+
+    img = center_crop(Image.open(image_path).convert("RGB"), (720, 480))
+    ref_depth = np.array(center_crop(ref_depth, (720, 480)))
+    
+    # crop to ensure the image dimensions are divisible by 8
+    img = img.crop((0, 0, img.width - img.width % 8, img.height - img.height % 8))
+
+    pbar = tqdm(total=3)
+    pbar.set_description("Hallucinating Scene")
+
+    gs_optimization_bundle, point_cloud = generate_point_cloud(img, prompt, extrinsics=key_extrinsics, seed=seed, ref_depth=ref_depth)
+
+    extrinsics[:, :3, 3] *= traj_rescale
+
+    # frames = gs_optimization_bundle["frames"]
+    # for i in range(len(frames)):
+    #     frames[i]['image'].save(os.path.join(output_path, f"generated_view_{i:03d}.jpg"))
+
+    pbar.update(1)
+    pbar.set_description("Generating Additional Views")
+
+    pbar.update(1)
+    pbar.set_description("Gaussian Splat Optimization")
+
+    scene = Scene(gs_optimization_bundle, GaussianModel(gs_options.sh_degree), gs_options)
+    scene = run_gaussian_splatting(scene, gs_optimization_bundle)
+
+    pbar.update(1)
+
+    # coordinate system transformation
+    scene.gaussians._xyz = scene.gaussians._xyz.detach()
+
+    cameras = extrinsics_to_fucking_cameras(extrinsics, img)
+    rgb_frames = render_gaussian_splatting(scene, cameras)
+    rgb_frames = [(x.detach().cpu().numpy() * 255).astype(np.uint8) for x in rgb_frames]
+    imageio.mimwrite(os.path.join(output_path, "rendered.mp4"), rgb_frames, fps=10, codec="libx264", ffmpeg_params=[
+        "-crf", "22",            
+        "-pix_fmt", "yuv420p"      
+    ])
+
+    return output_path
+
 if __name__ == "__main__":
     import fire
-    fire.Fire(generate_scene)
+    fire.Fire(generate_scene_custom)
+
 

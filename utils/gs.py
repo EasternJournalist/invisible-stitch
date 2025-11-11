@@ -12,7 +12,7 @@ from PIL import Image
 from gsplat.sh import num_sh_bases, spherical_harmonics
 from gsplat import project_gaussians, rasterize_gaussians
 
-from tqdm.auto import tqdm
+from tqdm.auto import tqdm, trange
 from torch import Tensor
 
 # All credit for this function goes to the nerfstudio project
@@ -169,7 +169,7 @@ def run_gaussian_splatting(scene, gs_optimization_bundle):
         T = w2v[3, :3].view(3, 1)  # 3 x 1
 
         viewmat = torch.eye(4, device=R.device, dtype=R.dtype)
-        viewmat[:3, :3] = R
+        viewmat[:3, :3] = R.T
         viewmat[:3, 3:4] = T
         H, W = viewpoint_cam.original_image.shape[1:]
 
@@ -245,6 +245,76 @@ def run_gaussian_splatting(scene, gs_optimization_bundle):
         pose_optimizer.zero_grad(set_to_none=True)
 
     return scene
+
+
+def render_gaussian_splatting(scene, cameras):
+    torch.cuda.empty_cache()
+
+    scene.gaussians._opacity = torch.ones_like(scene.gaussians._opacity)
+    
+    rgb_frames = []
+
+    for i in trange(len(cameras), desc='render'):
+        viewpoint_cam = cameras[i] 
+        w2v = viewpoint_cam.world_view_transform
+
+        R = w2v[:3, :3]  # 3 x 3
+        T = w2v[3, :3].view(3, 1)  # 3 x 1
+
+        viewmat = torch.eye(4, device=R.device, dtype=R.dtype)
+        viewmat[:3, :3] = R.T
+        viewmat[:3, 3:4] = T
+        H, W = viewpoint_cam.original_image.shape[1:]
+
+        cx = W / 2
+        cy = H / 2
+        fx = fov2focal(viewpoint_cam.FoVx, W)
+        fy = fov2focal(viewpoint_cam.FoVy, H)
+
+        colors = torch.cat((scene.gaussians._features_dc, scene.gaussians._features_rest), dim=1)
+        BLOCK_WIDTH = 16
+        xys, depths, radii, conics, comp, num_tiles_hit, cov3d = project_gaussians(  # type: ignore
+            scene.gaussians._xyz,
+            torch.exp(scene.gaussians._scaling),
+            1,
+            scene.gaussians._rotation / scene.gaussians._rotation.norm(dim=-1, keepdim=True),
+            viewmat.squeeze()[:3, :],
+            fx,
+            fy,
+            cx,
+            cy,
+            H,
+            W,
+            BLOCK_WIDTH,
+        )
+
+        #xys.retain_grad()
+
+        viewdirs = scene.gaussians._xyz.detach() - viewpoint_cam.world_view_transform[3, :3]  # (N, 3)
+        viewdirs = viewdirs / viewdirs.norm(dim=-1, keepdim=True)
+        rgbs = spherical_harmonics(gs_options.sh_degree, viewdirs, colors)
+        rgbs = torch.clamp(rgbs + 0.5, min=0.0)  # type: ignore
+
+        opacities = torch.sigmoid(scene.gaussians._opacity) * comp[:, None]
+
+        rgb, alpha = rasterize_gaussians(  # type: ignore
+            xys,
+            depths,
+            radii,
+            conics,
+            num_tiles_hit,  # type: ignore
+            rgbs,
+            opacities,
+            H,
+            W,
+            BLOCK_WIDTH,
+            background=torch.zeros(3, device=R.device),
+            return_alpha=True,
+        )  # type: ignore
+        rgb = torch.clamp(rgb, max=1.0)
+        rgb_frames.append(rgb.detach().cpu())
+
+    return rgb_frames
 
 gs_options = edict({
     "sh_degree": 3,
